@@ -1,0 +1,286 @@
+---
+title: "Forecasting task"
+author: "Sam Hickman"
+date: "25/06/2021"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Task information
+
+A dataset (DSA_dataset) is provided as described in the supporting Metadata and Dictionary documents. This data should be used to forecast the Demand and Import between the following dates:
+    2021-03-22 00:00
+    2021-03-28 23:59
+
+### Packages required
+
+```{r message=FALSE}
+library(readxl) 
+library(tidyverse)
+library(xts)
+library(forecast)
+library(tseries)
+```
+
+### Import data
+
+```{r message=FALSE}
+
+library(rstudioapi)
+
+setwd(selectDirectory("select folder with CSV files"))
+data <- read_xlsx("DSA Dataset.xlsx")
+
+```
+
+### Summary of the data
+
+```{r message=TRUE}
+head(data)
+summary(data)
+```
+
+We have data every 5 mins from 2020-12-01 00:00:00 to 2021-03-21 23:55:00
+
+Each variable has missing values (NA) between 91 and 96
+
+### Convert data to long format for plotting and visualise all the raw data 
+
+```{r message=TRUE}
+data.long <- data %>% 
+  select("Timestamp","Demand", "Generation", "Import", "Solar", "Wind", "Other") %>% 
+  pivot_longer(-Timestamp, names_to = "variable", values_to = "value")
+
+ggplot(data.long, aes(Timestamp, value, colour = variable)) +
+  geom_line() +
+  facet_grid(rows = vars(variable),scales = "free") +
+  scale_x_datetime(date_labels = "%b %Y") +
+  theme(legend.position = "none") +
+  xlab("time") +
+  ylab("load (Mw)")
+```
+
+Outliers are clearly present in Demand and Import
+
+### Print outliers to console
+
+```{r message=T}
+na.omit(data[data$Demand == boxplot.stats(data$Demand)$out,])
+na.omit(data[data$Import == boxplot.stats(data$Import)$out,])
+```
+
+### Remove outliers, save as a different dataframe & update long form
+
+```{r message=T}
+remove_outliers <- function(x, na.rm = TRUE, ...) {
+  qnt <- quantile(x, probs=c(.25, .75), na.rm = na.rm, ...)
+  H <- 1.5 * IQR(x, na.rm = na.rm)
+  y <- x
+  y[x < (qnt[1] - H)] <- NA
+  y[x > (qnt[2] + H)] <- NA
+  return(y)
+}
+
+# make separate dataframe without outliers
+
+data.no.outliers <- data
+data.no.outliers$Demand <- remove_outliers(data.no.outliers$Demand)
+data.no.outliers$Import <- remove_outliers(data.no.outliers$Import)
+
+# update long format to contain no outliers
+
+data.long <- data.no.outliers %>% 
+  select("Timestamp","Demand", "Generation", "Import", "Solar", "Wind", "Other") %>% 
+  pivot_longer(-Timestamp, names_to = "variable", values_to = "value")
+```
+
+### View one month of data 
+
+```{r message=T}
+data.long %>%
+  filter(Timestamp >= as.Date('2021-01-01') & Timestamp <= as.Date('2021-02-01')) %>%
+  ggplot(aes(Timestamp, value, colour = variable)) +
+  geom_line() +
+  facet_grid(rows = vars(variable),scales = "free") +
+  scale_x_datetime(date_labels = "%a %b %d") +
+  theme(legend.position = "none") +
+  xlab("time") +
+  ylab("load (Mw)")
+```
+
+### Plot of demand by weekday over the 3 months
+
+```{r message=T}
+data.long$dow = as.factor(format(data.long$Timestamp, format="%a"))
+
+ggplot(data.long,aes(dow,value,colour=variable)) + 
+  geom_boxplot() + 
+  scale_x_discrete(limits=c('Mon','Tue','Wed','Thu','Fri','Sat','Sun')) +
+  xlab("time") +
+  ylab("load (Mw)")
+```
+
+### Plot of demand by hour over the 3 months
+
+```{r message=T}
+data.long$hr = format(data.long$Timestamp, format="%H")
+
+ggplot(data.long,aes(hr,value,colour=variable)) + geom_boxplot() +
+  geom_smooth(aes(group=1)) +
+  facet_grid(rows = vars(variable),scales = "free") +
+  theme(legend.position = "none") +
+  xlab("time (hours)") +
+  ylab("load (Mw)")
+```
+
+
+## Forecasting Demand and Import
+
+### Convert dataframe to extensible time-series (xts) format
+
+```{r message=FALSE}
+demand.xts <- xts(data$Demand, order.by = data$Timestamp)
+import.xts <- xts(data$Import, order.by = data$Timestamp)
+```
+
+### Testing if demand and import are stationary
+
+```{r message=T}
+adf.test(na.omit(demand.xts), alternative="stationary")
+adf.test(na.omit(import.xts), alternative="stationary")
+```
+
+### Multi-Seasonal Time Series - introduce seasonal periods (days, weeks)
+
+Calculation of  seasonal periods:
+1440 mins per day / 5 min intervals = 288 5 min intervals per day. 
+10080 mins per week / 5 min intervals = 2016 5 mins intervals per week
+
+```{r message=F}
+demand.msts <- msts(demand.xts, seasonal.periods=c(288,2016))
+import.msts <- msts(import.xts, seasonal.periods=c(288,2016)) 
+```
+
+### Decompose the time series into seasonal, trend and remainder components and plot
+
+#### Demand
+
+```{r message=T}
+demand.msts %>% mstl() %>%
+  autoplot() + xlab("Weeks") + ylab("load (Mw)")
+```
+
+#### Import
+
+```{r message=T}
+import.msts %>% mstl() %>%
+  autoplot() + xlab("Weeks") + ylab("load (Mw)")
+```
+
+### Plot the naive forecast for 1 week and only show last 4 weeks in the plot
+
+#### Demand
+```{r message=T}
+demand.msts %>% stlf(method='naive', h =2016) %>%
+  autoplot(include=4*2016) + xlab("Weeks from 2020-12-01") + ylab("Demand (MW)") 
+```
+
+#### Import
+```{r message=T}
+import.msts %>% stlf(method='naive', h =2016) %>%
+  autoplot(include=4*2016) + xlab("Weeks from 2020-12-01") + ylab("Import (MW)") 
+```
+
+### Find the forecasting accuracy
+
+```{r message=T}
+demand.msts %>% stlf(method='naive', h =2016) %>% accuracy() 
+import.msts %>% stlf(method='naive', h =2016) %>% accuracy()
+```
+
+#### This only tells us the accuracy based on the training data set. Therefore the real data needs to be split to allow forecast accuracy to be compared to something. The last week of data was then used as the test to compare the forecast for demand.
+
+```{r message=T}
+data %>%
+  filter(Timestamp >= as.Date('2021-03-15 23:55:00')) -> test_data
+
+test_data_vec <- as.vector(test_data$Demand)
+
+data %>%
+  filter(Timestamp < as.Date('2021-03-15 23:55:00')) -> train_data
+
+xts(train_data$Demand, order.by = train_data$Timestamp) %>%
+  msts(seasonal.periods=c(288,2016)) -> train_data_msts
+
+train_data_msts %>% stlf(method='naive', h =2016) %>% accuracy(x=test_data_vec)
+train_data_msts %>% stlf(method='arima', h =2016) %>% accuracy(x=test_data_vec)
+train_data_msts %>% stlf(method='ets', h =2016) %>% accuracy(x=test_data_vec)
+train_data_msts %>% stlf(method='rwdrift', h =2016) %>% accuracy(x=test_data_vec)
+```
+
+#### We can see here that rwdrift was the best when compared to the real data for demand. Lets visualise this.
+
+```{r message=T}
+train_data_msts %>% stlf(method='rwdrift', h =2016) -> results.rwdrift
+
+forecasted_results <- as.data.frame(seq(as.POSIXct("2021-03-15 00:00:00",tz = "UTC"), as.POSIXct("2021-03-21 23:55:00",tz = "UTC"), by = "5 min"))
+
+colnames(forecasted_results) <- "Timestamp"
+
+forecasted_results$real <- test_data_vec
+forecasted_results$rwdrift <- results.rwdrift[["mean"]]
+
+forecasted_results.long <- forecasted_results %>% 
+  select("Timestamp","rwdrift","real") %>% 
+  pivot_longer(-Timestamp, names_to = "variable", values_to = "value")
+
+ggplot(forecasted_results.long, aes(Timestamp, value, colour = variable)) +
+  geom_line() +
+  scale_x_datetime(date_labels = "%d %b %Y") +
+  ggtitle("rwdrift forecast vs real data") +
+  xlab("time") +
+  ylab("load (Mw)")
+```
+
+### The same is done for Import
+
+```{r message=T}
+
+test_data_import_vec <- as.vector(test_data$Import)
+
+xts(train_data$Import, order.by = train_data$Timestamp) %>%
+  msts(seasonal.periods=c(288,2016)) -> train_data_import_msts
+
+train_data_import_msts %>% stlf(method='naive', h =2016) %>% accuracy(x=test_data_import_vec)
+train_data_import_msts %>% stlf(method='arima', h =2016) %>% accuracy(x=test_data_import_vec)
+train_data_import_msts %>% stlf(method='ets', h =2016) %>% accuracy(x=test_data_import_vec)
+train_data_import_msts %>% stlf(method='rwdrift', h =2016) %>% accuracy(x=test_data_import_vec)
+```
+
+#### Naive wins for Import
+
+## forecasting the unknown week
+
+### demand
+
+```{r message=T}
+demand.msts %>%
+  msts(seasonal.periods=c(288,2016)) %>%
+  stlf(method="rwdrift",h = 2016) %>% 
+  autoplot(include=4*2016) + xlab("Weeks from 2020-12-01") + ylab("Demand (MW)")
+```
+
+### import
+
+```{r message=T}
+import.msts %>%
+  msts(seasonal.periods=c(288,2016)) %>%
+  stlf(method="naive",h = 2016) %>% 
+  autoplot(include=4*2016) + xlab("Weeks from 2020-12-01") + ylab("Import (MW)")
+```
